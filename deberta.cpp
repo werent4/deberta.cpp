@@ -188,13 +188,68 @@ void deberta_free(deberta_ctx* ctx) {
 }
 
 // forward
+ggml_tensor* build_delta(ggml_context* ctx, int seq_len, int k) {
+    ggml_tensor* delta = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, seq_len, seq_len);
+    int* data = (int*)delta->data;
+    for (int i = 0; i < seq_len; i++) {
+        for (int j = 0; j < seq_len; j++) {
+            int d = i - j + k;
+            d = d < 0 ? 0 : d;
+            d = d > 2*k-1 ? 2*k-1 : d;
+            data[i * seq_len + j] = d;
+        }
+    }
+    return delta;
+}
+
+static void ggml_gather_cr(
+    struct ggml_tensor* dst,
+    const struct ggml_tensor* placeholder, 
+    const struct ggml_tensor* src,
+    const struct ggml_tensor* idx,
+    int ith, int nth, void* userdata
+) {
+    int seq_len = idx->ne[0];
+    float* src_data = (float*)src->data;
+    int*   idx_data = (int*)idx->data;
+    float* dst_data = (float*)dst->data;
+
+    for (int i = 0; i < seq_len; i++) {
+        for (int j = 0; j < seq_len; j++) {
+            int d = idx_data[i * seq_len + j];
+            dst_data[i * seq_len + j] = src_data[i * src->ne[0] + d];
+        }
+    }
+}
+
+static void ggml_gather_rc(
+    struct ggml_tensor* dst,
+    const struct ggml_tensor* placeholder, 
+    const struct ggml_tensor* src,
+    const struct ggml_tensor* idx,
+    int ith, int nth, void* userdata
+) {
+    int seq_len = idx->ne[0];
+    float* src_data = (float*)src->data;
+    int*   idx_data = (int*)idx->data;
+    float* dst_data = (float*)dst->data;
+
+    for (int i = 0; i < seq_len; i++) {
+        for (int j = 0; j < seq_len; j++) {
+            int d = idx_data[i * seq_len + j];
+            dst_data[i * seq_len + j] = src_data[d * src->ne[1] + j];
+        }
+    }
+}
+
 struct ggml_cgraph* deberta_build_graph(
     struct deberta_ctx* ctx,
     struct ggml_context* compute_ctx,
     const std::vector<int>& input_ids
 ) {
-    ggml_tensor* input_ids_tensor = ggml_new_tensor_1d(compute_ctx, GGML_TYPE_I32, input_ids.size()); // todo: select type based on model.wtype
-    memcpy(input_ids_tensor->data, input_ids.data(), input_ids.size() * sizeof(int));
+    int seq_len = input_ids.size();
+    ggml_tensor* input_ids_tensor = ggml_new_tensor_1d(compute_ctx, GGML_TYPE_I32, seq_len); // todo: select type based on model.wtype
+    memcpy(input_ids_tensor->data, input_ids.data(), seq_len * sizeof(int));
     ggml_tensor* word_embeddings = ctx->model.tensors["embeddings.word_embeddings.weight"];
     ggml_tensor* x = ggml_get_rows(compute_ctx, word_embeddings, input_ids_tensor);
 
@@ -222,13 +277,10 @@ struct ggml_cgraph* deberta_build_graph(
 
         ggml_tensor* Q_c = ggml_mul_mat(compute_ctx, q_w, x);
         Q_c = ggml_add(compute_ctx, Q_c, q_b);
-        // printf("Q_c: [%lld, %lld], q_b: [%lld, %lld]\n", Q_c->ne[0], Q_c->ne[1], q_b->ne[0], q_b->ne[1]);
         ggml_tensor* K_c = ggml_mul_mat(compute_ctx, k_w, x);
         K_c = ggml_add(compute_ctx, K_c, k_b);
-        // printf("K_c: [%lld, %lld], k_b: [%lld, %lld]\n", K_c->ne[0], K_c->ne[1], k_b->ne[0], k_b->ne[1]);
         ggml_tensor* V_c = ggml_mul_mat(compute_ctx, v_w, x);
         V_c = ggml_add(compute_ctx, V_c, v_b);
-        // printf("V_c: [%lld, %lld], v_b: [%lld, %lld]\n", V_c->ne[0], V_c->ne[1], v_b->ne[0], v_b->ne[1]);
 
         ggml_tensor* P = ctx->model.tensors["encoder.rel_embeddings.weight"];
         ggml_tensor* K_r = ggml_mul_mat(compute_ctx, k_w, P);
@@ -236,11 +288,19 @@ struct ggml_cgraph* deberta_build_graph(
         ggml_tensor* Q_r = ggml_mul_mat(compute_ctx, q_w, P);
         Q_r = ggml_add(compute_ctx, Q_r, q_b);
 
+        ggml_tensor* delta = build_delta(compute_ctx, seq_len, ctx->model.hparams.position_buckets);
         ggml_tensor* A_cc = ggml_mul_mat(compute_ctx, K_c, Q_c);
-        // ggml_tensor* A_cr = ggml_mul_mat(compute_ctx, K_r, Q_c);
-        // ggml_tensor* A_rc = ggml_mul_mat(compute_ctx, K_c, Q_r);
-        ggml_tensor* A = A_cc;//ggml_add(compute_ctx, A_cc, A_cr);
-        // A = ggml_add(compute_ctx, A, A_rc);
+
+        ggml_tensor* A_cr_full = ggml_mul_mat(compute_ctx, K_r, Q_c);
+        ggml_tensor* out_cr = ggml_new_tensor_2d(compute_ctx, GGML_TYPE_F32, seq_len, seq_len); // todo: select type based on model.wtype
+        ggml_tensor* A_cr = ggml_map_custom3(compute_ctx, out_cr, A_cr_full, delta, ggml_gather_cr, 1, nullptr);
+
+        ggml_tensor* A_rc_full = ggml_mul_mat(compute_ctx, K_c, Q_r);
+        ggml_tensor* out_rc = ggml_new_tensor_2d(compute_ctx, GGML_TYPE_F32, seq_len, seq_len); // todo: select type based on model.wtype
+        ggml_tensor* A_rc = ggml_map_custom3(compute_ctx, out_rc, A_rc_full, delta, ggml_gather_rc, 1, nullptr);
+
+        ggml_tensor* A = ggml_add(compute_ctx, A_cc, A_cr);
+        A = ggml_add(compute_ctx, A, A_rc);
         float scale = 1.0f / sqrtf(3.0f * ctx->model.hparams.hidden_size);
         A = ggml_scale(compute_ctx, A, scale);
 

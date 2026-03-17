@@ -50,6 +50,8 @@ struct deberta_ctx* deberta_load_from_file(const std::string& fname);
 
 void deberta_free(deberta_ctx* ctx);
 
+ggml_tensor* build_delta(ggml_context* ctx, int seq_len, int k);
+
 struct ggml_cgraph* deberta_build_graph(
     struct deberta_ctx* ctx,
     struct ggml_context* compute_ctx,
