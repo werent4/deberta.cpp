@@ -231,6 +231,21 @@ static ggml_tensor* ggml_gather_axis1(
     return ggml_map_custom2(ctx, dummy, src, gather_custom_op, 1, (void*)idx_tensor->data);
 }
 
+static int32_t log_bucket_pos(int32_t rel_pos, int bucket_size, int max_position) {
+    int mid = bucket_size / 2;
+    if (rel_pos > -mid && rel_pos < mid)
+        return rel_pos;
+
+    int sign = (rel_pos > 0) ? 1 : -1;
+    float abs_pos = (float)std::abs(rel_pos);
+    float log_pos = std::ceil(
+        std::log(abs_pos / mid) /
+        std::log((float)(max_position - 1) / mid) *
+        (float)(mid - 1)
+    ) + mid;
+    return (int32_t)(sign * log_pos);
+}
+
 static ggml_tensor* deberta_build_embeddings(
     struct ggml_context* compute_ctx,
     struct deberta_ctx* ctx,
@@ -261,7 +276,8 @@ static ggml_tensor* deberta_build_attention(
     int n_heads,
     int head_dim,
     int seq,
-    int max_rel
+    int max_rel,
+    int max_pos
 ) {
     const int hidden = n_heads * head_dim;
     const float scale = sqrtf((float)(head_dim * 3));
@@ -310,8 +326,10 @@ static ggml_tensor* deberta_build_attention(
     {
         int32_t* p = (int32_t*)c2p_idx->data;
         for (int i = 0; i < seq; i++)
-            for (int j = 0; j < seq; j++)
-                p[j + i*seq] = std::clamp((i - j) + att_span, 0, n_pos - 1);
+            for (int j = 0; j < seq; j++) {
+                int32_t raw_c2p = log_bucket_pos(i - j, att_span, max_pos);
+                p[j + i*seq] = std::clamp(raw_c2p + att_span, 0, n_pos - 1);
+            }
     }
 
     ggml_tensor* c2p = ggml_gather_axis1(cctx, c2p_raw, c2p_idx, seq, n_heads);
@@ -333,8 +351,10 @@ static ggml_tensor* deberta_build_attention(
     {
         int32_t* p = (int32_t*)p2c_idx->data;
         for (int i = 0; i < seq; i++)
-            for (int j = 0; j < seq; j++)
-                p[j + i*seq] = std::clamp(-(i - j) + att_span, 0, n_pos - 1);
+            for (int j = 0; j < seq; j++) {
+                int32_t raw_p2c = log_bucket_pos(-(i - j), att_span, max_pos);
+                p[j + i*seq] = std::clamp(raw_p2c + att_span, 0, n_pos - 1);
+            }
     }
 
     ggml_tensor* p2c = ggml_gather_axis1(cctx, p2c_raw, p2c_idx, seq, n_heads);
@@ -399,7 +419,7 @@ struct ggml_cgraph* deberta_build_graph(
     if (max_rel < 1) {
         max_rel = ctx->model.hparams.position_buckets;
     }
-
+    int max_pos = ctx->model.hparams.max_position_embeddings;
     ggml_tensor* x = deberta_build_embeddings(compute_ctx, ctx, input_ids);
 
     std::string layer_prefix = "encoder.layer.";
@@ -424,7 +444,7 @@ struct ggml_cgraph* deberta_build_graph(
             .ln_b = ctx->model.tensors[layer_prefix + std::to_string(i) + ".attention.output.LayerNorm.bias"],
         };
 
-        x = deberta_build_attention(compute_ctx, x, attn_tensors, rel_emb, n_heads, head_dim, seq_len, max_rel);
+        x = deberta_build_attention(compute_ctx, x, attn_tensors, rel_emb, n_heads, head_dim, seq_len, max_rel, max_pos);
 
         deberta_inter_ffn_tensors inter_ffn_tensors = {
             .inter_w = ctx->model.tensors[layer_prefix + std::to_string(i) + ".intermediate.dense.weight"],
