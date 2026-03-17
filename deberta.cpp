@@ -200,9 +200,9 @@ void deberta_free(deberta_ctx* ctx) {
 
 // forward
 static void gather_custom_op(
-    struct ggml_tensor*       dst,   // [seq, seq, n_heads] — выходная форма
-    const struct ggml_tensor* dummy, // a — только для формы, данные не используем
-    const struct ggml_tensor* src,   // b — [n_pos, seq, n_heads]
+    struct ggml_tensor* dst, 
+    const struct ggml_tensor* dummy,
+    const struct ggml_tensor* src,
     int ith, int nth, void* userdata
 ) {
     (void)ith; (void)nth; (void)dummy;
@@ -373,7 +373,8 @@ static ggml_tensor* deberta_build_ffn(
                  ggml_repeat(cctx,
                      ggml_reshape_2d(cctx, T.inter_b, T.inter_b->ne[0], 1),
                      inter));
-    inter = ggml_gelu(cctx, inter);
+
+    inter = ggml_unary(cctx, inter, GGML_UNARY_OP_GELU_ERF);
 
     ggml_tensor* out = ggml_mul_mat(cctx, T.out_w, inter);
     out = ggml_add(cctx, out,
