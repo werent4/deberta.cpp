@@ -38,7 +38,9 @@ print(model)
 
 list_vars = model.state_dict()
 for name, tensor in list_vars.items():
-    print(name, tensor.shape, tensor.dtype)
+    if "embed_proj" in name:
+        print(f"{name}: shape={tensor.shape}")  
+    # print(name, tensor.shape, tensor.dtype)
 
 # weights to skip
 SKIP = {
@@ -66,6 +68,10 @@ fout.write(struct.pack("i", hparams["num_hidden_layers"]))
 fout.write(struct.pack("i", hparams.get("position_buckets", 256)))
 fout.write(struct.pack("i", hparams.get("max_relative_positions", -1)))
 fout.write(struct.pack("i", ftype))
+fout.write(struct.pack("i", hparams.get("embedding_size", hparams["hidden_size"])))
+fout.write(struct.pack("i", hparams.get("type_vocab_size", 0)))
+fout.write(struct.pack("i", int(hparams.get("position_biased_input", True))))
+fout.write(struct.pack("f", hparams.get("layer_norm_eps", 1e-7)))
 
 # tensors
 for name, tensor in list_vars.items():
@@ -87,7 +93,8 @@ for name, tensor in list_vars.items():
         data = data.astype(np.float32)
         l_type = 0
 
-    print(f"Writing {name} shape={data.shape} dtype={data.dtype}")
+    if "embed" in name.lower():
+        print(f"Writing {name} shape={data.shape} dtype={data.dtype}")
 
     encoded_name = name.encode("utf-8")
     fout.write(struct.pack("iii", n_dims, len(encoded_name), l_type))

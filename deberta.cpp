@@ -1,7 +1,10 @@
 #include "deberta.h"
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+
+#include "ggml/include/ggml-cpu.h"
 
 bool deberta_load_hparams(FILE* f, deberta_model& model) {
     if (!f) {
@@ -27,6 +30,10 @@ bool deberta_load_hparams(FILE* f, deberta_model& model) {
     fread(&hparams.position_buckets, sizeof(int), 1, f);
     fread(&hparams.max_relative_positions, sizeof(int), 1, f);
     fread(&hparams.ftype, sizeof(int), 1, f);
+    fread(&hparams.embedding_size,        sizeof(int),   1, f);
+    fread(&hparams.type_vocab_size,       sizeof(int),   1, f);
+    fread(&hparams.position_biased_input, sizeof(int),   1, f);
+    fread(&hparams.layer_norm_eps,        sizeof(float), 1, f);
 
     printf("vocab_size = %d\n", hparams.vocab_size);
     printf("max_position_embeddings = %d\n", hparams.max_position_embeddings);
@@ -37,6 +44,10 @@ bool deberta_load_hparams(FILE* f, deberta_model& model) {
     printf("position_buckets = %d\n", hparams.position_buckets);
     printf("max_relative_positions = %d\n", hparams.max_relative_positions);
     printf("ftype = %d\n", hparams.ftype);
+    printf("embedding_size = %d\n", hparams.embedding_size);
+    printf("type_vocab_size = %d\n", hparams.type_vocab_size);
+    printf("position_biased_input = %d\n", hparams.position_biased_input);
+    printf("layer_norm_eps = %f\n", hparams.layer_norm_eps);
 
     fseek(f, 0, SEEK_SET); // move file pointer to the beginning of file
 
@@ -49,7 +60,7 @@ bool deberta_calc_mem_req(FILE* f, size_t& model_mem_req) {
         return false;
     }
     model_mem_req = 0;
-    fseek(f, 10 * sizeof(int), SEEK_SET); // skip hparams + magic (10 integers)
+    fseek(f, 14 * sizeof(int), SEEK_SET); // skip hparams + magic (10 integers)
 
     while (true) {
         int n_dims, name_len, ftype;
@@ -88,7 +99,7 @@ bool deberta_load_weights(FILE* f, struct deberta_model* model) {
     }
     auto& tensors = model->tensors;
 
-    fseek(f, 10 * sizeof(int), SEEK_SET); // skip hparams + magic (10 integers)
+    fseek(f, 14 * sizeof(int), SEEK_SET); // skip hparams + magic (10 integers)
     while (true) {
         int n_dims, name_len, ftype;
         if (fread(&n_dims, sizeof(int), 1, f) != 1) break;
@@ -188,68 +199,47 @@ void deberta_free(deberta_ctx* ctx) {
 }
 
 // forward
-ggml_tensor* build_delta(ggml_context* ctx, int seq_len, int k) {
-    ggml_tensor* delta = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, seq_len, seq_len);
-    int* data = (int*)delta->data;
-    for (int i = 0; i < seq_len; i++) {
-        for (int j = 0; j < seq_len; j++) {
-            int d = i - j + k;
-            d = d < 0 ? 0 : d;
-            d = d > 2*k-1 ? 2*k-1 : d;
-            data[i * seq_len + j] = d;
-        }
-    }
-    return delta;
-}
-
-static void ggml_gather_cr(
-    struct ggml_tensor* dst,
-    const struct ggml_tensor* placeholder, 
-    const struct ggml_tensor* src,
-    const struct ggml_tensor* idx,
+static void gather_custom_op(
+    struct ggml_tensor*       dst,   // [seq, seq, n_heads] — выходная форма
+    const struct ggml_tensor* dummy, // a — только для формы, данные не используем
+    const struct ggml_tensor* src,   // b — [n_pos, seq, n_heads]
     int ith, int nth, void* userdata
 ) {
-    int seq_len = idx->ne[0];
-    float* src_data = (float*)src->data;
-    int*   idx_data = (int*)idx->data;
-    float* dst_data = (float*)dst->data;
+    (void)ith; (void)nth; (void)dummy;
+    const int32_t* idx  = (const int32_t*)userdata;
+    const float*   in   = (const float*)src->data;
+    float*         out  = (float*)dst->data;
 
-    for (int i = 0; i < seq_len; i++) {
-        for (int j = 0; j < seq_len; j++) {
-            int d = idx_data[i * seq_len + j];
-            dst_data[i * seq_len + j] = src_data[i * src->ne[0] + d];
-        }
-    }
+    const int seq     = dst->ne[0];
+    const int n_heads = dst->ne[2];
+    const int n_pos   = src->ne[0];
+
+    for (int h = 0; h < n_heads; h++)
+        for (int i = 0; i < seq; i++)
+            for (int j = 0; j < seq; j++)
+                out[j + i*seq + h*seq*seq] =
+                    in[idx[j + i*seq] + i*n_pos + h*n_pos*seq];
 }
 
-static void ggml_gather_rc(
-    struct ggml_tensor* dst,
-    const struct ggml_tensor* placeholder, 
-    const struct ggml_tensor* src,
-    const struct ggml_tensor* idx,
-    int ith, int nth, void* userdata
+static ggml_tensor* ggml_gather_axis1(
+    ggml_context* ctx,
+    ggml_tensor*  src,
+    ggml_tensor*  idx_tensor,
+    int seq, int n_heads
 ) {
-    int seq_len = idx->ne[0];
-    float* src_data = (float*)src->data;
-    int*   idx_data = (int*)idx->data;
-    float* dst_data = (float*)dst->data;
-
-    for (int i = 0; i < seq_len; i++) {
-        for (int j = 0; j < seq_len; j++) {
-            int d = idx_data[i * seq_len + j];
-            dst_data[i * seq_len + j] = src_data[d * src->ne[1] + j];
-        }
-    }
+    ggml_tensor* dummy = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, seq, seq, n_heads);
+    return ggml_map_custom2(ctx, dummy, src, gather_custom_op, 1, (void*)idx_tensor->data);
 }
 
-struct ggml_cgraph* deberta_build_graph(
-    struct deberta_ctx* ctx,
+static ggml_tensor* deberta_build_embeddings(
     struct ggml_context* compute_ctx,
+    struct deberta_ctx* ctx,
     const std::vector<int>& input_ids
 ) {
     int seq_len = input_ids.size();
     ggml_tensor* input_ids_tensor = ggml_new_tensor_1d(compute_ctx, GGML_TYPE_I32, seq_len); // todo: select type based on model.wtype
     memcpy(input_ids_tensor->data, input_ids.data(), seq_len * sizeof(int));
+
     ggml_tensor* word_embeddings = ctx->model.tensors["embeddings.word_embeddings.weight"];
     ggml_tensor* x = ggml_get_rows(compute_ctx, word_embeddings, input_ids_tensor);
 
@@ -260,86 +250,190 @@ struct ggml_cgraph* deberta_build_graph(
     x = ggml_mul(compute_ctx, x, ln_w);
     x = ggml_add(compute_ctx, x, ln_b);
 
+    return x;
+}
+
+static ggml_tensor* deberta_build_attention(
+    ggml_context* cctx,
+    ggml_tensor* x, // [hidden, seq]
+    deberta_attn_tensors& T,
+    ggml_tensor* rel_emb,  
+    int n_heads,
+    int head_dim,
+    int seq,
+    int max_rel
+) {
+    const int hidden = n_heads * head_dim;
+    const float scale = sqrtf((float)(head_dim * 3));
+    // c2c
+    ggml_tensor* Q = ggml_mul_mat(cctx, T.q_w, x);
+    Q = ggml_add(cctx, Q, T.q_b);
+    
+    ggml_tensor* K = ggml_mul_mat(cctx, T.k_w, x);
+    K = ggml_add(cctx, K, T.k_b);
+    
+    ggml_tensor* V = ggml_mul_mat(cctx, T.v_w, x);
+    V = ggml_add(cctx, V, T.v_b);
+
+    // ggml layout: ne[0]=head_dim, ne[1]=n_heads, ne[2]=seq
+    Q = ggml_reshape_3d(cctx, Q, head_dim, n_heads, seq);
+    K = ggml_reshape_3d(cctx, K, head_dim, n_heads, seq);
+    V = ggml_reshape_3d(cctx, V, head_dim, n_heads, seq);
+
+    Q = ggml_scale(cctx, Q, 1.0f / scale);
+
+    Q = ggml_cont(cctx, ggml_permute(cctx, Q, 0, 2, 1, 3));  // [head_dim, seq, n_heads]
+    K = ggml_cont(cctx, ggml_permute(cctx, K, 0, 2, 1, 3));
+    V = ggml_cont(cctx, ggml_permute(cctx, V, 1, 2, 0, 3)); 
+
+    ggml_tensor* scores = ggml_mul_mat(cctx, K, Q);
+
+    // c2p
+    const int att_span = max_rel;
+    const int n_pos = 2 * att_span;
+
+    size_t offset = (size_t)(max_rel - att_span) * rel_emb->nb[1];
+    ggml_tensor* rel_slice = ggml_view_2d(cctx, rel_emb, rel_emb->ne[0], n_pos, rel_emb->nb[1], 0); // offset
+
+
+    ggml_tensor* pos_key = ggml_mul_mat(cctx, T.k_w, rel_slice);
+    pos_key = ggml_add(cctx, pos_key,
+                  ggml_repeat(cctx,
+                      ggml_reshape_2d(cctx, T.k_b, T.k_b->ne[0], 1),
+                      pos_key));
+
+    pos_key = ggml_reshape_3d(cctx, pos_key, head_dim, n_heads, n_pos);
+    pos_key = ggml_cont(cctx, ggml_permute(cctx, pos_key, 0, 2, 1, 3)); // [head_dim, n_pos, n_heads]
+
+    ggml_tensor* c2p_raw = ggml_mul_mat(cctx, pos_key, Q);
+    ggml_tensor* c2p_idx = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, seq, seq);
+    {
+        int32_t* p = (int32_t*)c2p_idx->data;
+        for (int i = 0; i < seq; i++)
+            for (int j = 0; j < seq; j++)
+                p[j + i*seq] = std::clamp((i - j) + att_span, 0, n_pos - 1);
+    }
+
+    ggml_tensor* c2p = ggml_gather_axis1(cctx, c2p_raw, c2p_idx, seq, n_heads);
+    scores = ggml_add(cctx, scores, c2p);
+
+    // p2c 
+    ggml_tensor* pos_query = ggml_mul_mat(cctx, T.q_w, rel_slice);
+    pos_query = ggml_add(cctx, pos_query,
+                    ggml_repeat(cctx,
+                        ggml_reshape_2d(cctx, T.q_b, T.q_b->ne[0], 1),
+                        pos_query));
+    pos_query = ggml_reshape_3d(cctx, pos_query, head_dim, n_heads, n_pos);
+    pos_query = ggml_cont(cctx, ggml_permute(cctx, pos_query, 0, 2, 1, 3)); 
+    pos_query = ggml_scale(cctx, pos_query, 1.0f / scale);
+
+    ggml_tensor* p2c_raw = ggml_mul_mat(cctx, pos_query, K);
+
+    ggml_tensor* p2c_idx = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, seq, seq);
+    {
+        int32_t* p = (int32_t*)p2c_idx->data;
+        for (int i = 0; i < seq; i++)
+            for (int j = 0; j < seq; j++)
+                p[j + i*seq] = std::clamp(-(i - j) + att_span, 0, n_pos - 1);
+    }
+
+    ggml_tensor* p2c = ggml_gather_axis1(cctx, p2c_raw, p2c_idx, seq, n_heads);
+    p2c = ggml_cont(cctx, ggml_permute(cctx, p2c, 1, 0, 2, 3));
+
+    scores = ggml_add(cctx, scores, p2c);
+
+
+    scores = ggml_soft_max(cctx, scores);
+
+
+    ggml_tensor* ctx_layer = ggml_mul_mat(cctx, V, scores);
+    ctx_layer = ggml_cont(cctx, ggml_permute(cctx, ctx_layer, 0, 2, 1, 3)); 
+    ctx_layer = ggml_reshape_2d(cctx, ctx_layer, hidden, seq);
+
+    ggml_tensor* attn_out = ggml_mul_mat(cctx, T.out_w, ctx_layer);
+    attn_out = ggml_add(cctx, attn_out,
+                   ggml_repeat(cctx,
+                       ggml_reshape_2d(cctx, T.out_b, T.out_b->ne[0], 1),
+                       attn_out));
+
+    attn_out = ggml_add(cctx, attn_out, x);
+    attn_out = ggml_norm(cctx, attn_out, 1e-7f);
+    attn_out = ggml_add(cctx, ggml_mul(cctx, attn_out, T.ln_w), T.ln_b);
+
+    return attn_out; 
+}
+
+static ggml_tensor* deberta_build_ffn(
+    ggml_context* cctx,
+    ggml_tensor* x, // [hidden, seq]
+    deberta_inter_ffn_tensors& T
+) {
+    ggml_tensor* inter = ggml_mul_mat(cctx, T.inter_w, x);
+    inter = ggml_add(cctx, inter,
+                 ggml_repeat(cctx,
+                     ggml_reshape_2d(cctx, T.inter_b, T.inter_b->ne[0], 1),
+                     inter));
+    inter = ggml_gelu(cctx, inter);
+
+    ggml_tensor* out = ggml_mul_mat(cctx, T.out_w, inter);
+    out = ggml_add(cctx, out,
+                 ggml_repeat(cctx,
+                     ggml_reshape_2d(cctx, T.out_b, T.out_b->ne[0], 1),
+                     out));
+    out = ggml_add(cctx, out, x);
+    out = ggml_norm(cctx, out, 1e-7f);
+    out = ggml_add(cctx, ggml_mul(cctx, out, T.ln_w), T.ln_b);    
+    return out;
+}
+
+struct ggml_cgraph* deberta_build_graph(
+    struct deberta_ctx* ctx,
+    struct ggml_context* compute_ctx,
+    const std::vector<int>& input_ids
+) {
+    int seq_len = input_ids.size();
+    int n_heads = ctx->model.hparams.num_attention_heads;
+    int head_dim = ctx->model.hparams.hidden_size / n_heads;
+    int max_rel = ctx->model.hparams.max_relative_positions;
+    if (max_rel < 1) {
+        max_rel = ctx->model.hparams.position_buckets;
+    }
+
+    ggml_tensor* x = deberta_build_embeddings(compute_ctx, ctx, input_ids);
+
+    std::string layer_prefix = "encoder.layer.";
+    ggml_tensor* rel_emb = ctx->model.tensors["encoder.rel_embeddings.weight"];
+    rel_emb = ggml_norm(compute_ctx, rel_emb, 1e-7f);
+    rel_emb = ggml_add(compute_ctx,
+            ggml_mul(compute_ctx, rel_emb, ctx->model.tensors["encoder.LayerNorm.weight"]),
+            ctx->model.tensors["encoder.LayerNorm.bias"]);
+
     int N = ctx->model.hparams.num_hidden_layers;
     for (int i = 0; i < N; i++) {
-        std::string layer = "encoder.layer." + std::to_string(i);
-        // Self-Attention
-        ggml_tensor* q_w = ctx->model.tensors[layer + ".attention.self.query_proj.weight"];
-        ggml_tensor* q_b = ctx->model.tensors[layer + ".attention.self.query_proj.bias"];
-        ggml_tensor* k_w = ctx->model.tensors[layer + ".attention.self.key_proj.weight"];
-        ggml_tensor* k_b = ctx->model.tensors[layer + ".attention.self.key_proj.bias"];
-        ggml_tensor* v_w = ctx->model.tensors[layer + ".attention.self.value_proj.weight"];
-        ggml_tensor* v_b = ctx->model.tensors[layer + ".attention.self.value_proj.bias"];
-        ggml_tensor* attn_out_w = ctx->model.tensors[layer + ".attention.output.dense.weight"];
-        ggml_tensor* attn_out_b = ctx->model.tensors[layer + ".attention.output.dense.bias"];
-        ggml_tensor* attn_ln_w = ctx->model.tensors[layer + ".attention.output.LayerNorm.weight"];
-        ggml_tensor* attn_ln_b = ctx->model.tensors[layer + ".attention.output.LayerNorm.bias"];
+        deberta_attn_tensors attn_tensors = {
+            .q_w = ctx->model.tensors[layer_prefix + std::to_string(i) + ".attention.self.query_proj.weight"],
+            .q_b = ctx->model.tensors[layer_prefix + std::to_string(i) + ".attention.self.query_proj.bias"],
+            .k_w = ctx->model.tensors[layer_prefix + std::to_string(i) + ".attention.self.key_proj.weight"],
+            .k_b = ctx->model.tensors[layer_prefix + std::to_string(i) + ".attention.self.key_proj.bias"],
+            .v_w = ctx->model.tensors[layer_prefix + std::to_string(i) + ".attention.self.value_proj.weight"],
+            .v_b = ctx->model.tensors[layer_prefix + std::to_string(i) + ".attention.self.value_proj.bias"],
+            .out_w = ctx->model.tensors[layer_prefix + std::to_string(i) + ".attention.output.dense.weight"],
+            .out_b = ctx->model.tensors[layer_prefix + std::to_string(i) + ".attention.output.dense.bias"],
+            .ln_w = ctx->model.tensors[layer_prefix + std::to_string(i) + ".attention.output.LayerNorm.weight"],
+            .ln_b = ctx->model.tensors[layer_prefix + std::to_string(i) + ".attention.output.LayerNorm.bias"],
+        };
 
-        ggml_tensor* Q_c = ggml_mul_mat(compute_ctx, q_w, x);
-        Q_c = ggml_add(compute_ctx, Q_c, q_b);
-        ggml_tensor* K_c = ggml_mul_mat(compute_ctx, k_w, x);
-        K_c = ggml_add(compute_ctx, K_c, k_b);
-        ggml_tensor* V_c = ggml_mul_mat(compute_ctx, v_w, x);
-        V_c = ggml_add(compute_ctx, V_c, v_b);
+        x = deberta_build_attention(compute_ctx, x, attn_tensors, rel_emb, n_heads, head_dim, seq_len, max_rel);
 
-        ggml_tensor* P = ctx->model.tensors["encoder.rel_embeddings.weight"];
-        ggml_tensor* K_r = ggml_mul_mat(compute_ctx, k_w, P);
-        K_r = ggml_add(compute_ctx, K_r, k_b);
-        ggml_tensor* Q_r = ggml_mul_mat(compute_ctx, q_w, P);
-        Q_r = ggml_add(compute_ctx, Q_r, q_b);
-
-        ggml_tensor* delta = build_delta(compute_ctx, seq_len, ctx->model.hparams.position_buckets);
-        ggml_tensor* A_cc = ggml_mul_mat(compute_ctx, K_c, Q_c);
-
-        ggml_tensor* A_cr_full = ggml_mul_mat(compute_ctx, K_r, Q_c);
-        ggml_tensor* out_cr = ggml_new_tensor_2d(compute_ctx, GGML_TYPE_F32, seq_len, seq_len); // todo: select type based on model.wtype
-        ggml_tensor* A_cr = ggml_map_custom3(compute_ctx, out_cr, A_cr_full, delta, ggml_gather_cr, 1, nullptr);
-
-        ggml_tensor* A_rc_full = ggml_mul_mat(compute_ctx, K_c, Q_r);
-        ggml_tensor* out_rc = ggml_new_tensor_2d(compute_ctx, GGML_TYPE_F32, seq_len, seq_len); // todo: select type based on model.wtype
-        ggml_tensor* A_rc = ggml_map_custom3(compute_ctx, out_rc, A_rc_full, delta, ggml_gather_rc, 1, nullptr);
-
-        ggml_tensor* A = ggml_add(compute_ctx, A_cc, A_cr);
-        A = ggml_add(compute_ctx, A, A_rc);
-        float scale = 1.0f / sqrtf(3.0f * ctx->model.hparams.hidden_size);
-        A = ggml_scale(compute_ctx, A, scale);
-
-
-        ggml_tensor* H = ggml_soft_max(compute_ctx, A);
-        ggml_tensor* V_c_T = ggml_cont(compute_ctx, ggml_transpose(compute_ctx, V_c));
-        H = ggml_mul_mat(compute_ctx, V_c_T, H);
-
-        H = ggml_mul_mat(compute_ctx, attn_out_w, H);
-        H = ggml_add(compute_ctx, H, attn_out_b);
-
-        // residual + LayerNorm
-        H = ggml_add(compute_ctx, x, H);
-        H = ggml_norm(compute_ctx, H, 1e-7f);
-        H = ggml_mul(compute_ctx, H, attn_ln_w);
-        H = ggml_add(compute_ctx, H, attn_ln_b);
-
-        x = H;
-
-        // FFN
-        ggml_tensor* ffn_w1 = ctx->model.tensors[layer + ".intermediate.dense.weight"];
-        ggml_tensor* ffn_b1 = ctx->model.tensors[layer + ".intermediate.dense.bias"];
-        ggml_tensor* ffn_w2 = ctx->model.tensors[layer + ".output.dense.weight"];
-        ggml_tensor* ffn_b2 = ctx->model.tensors[layer + ".output.dense.bias"];
-        ggml_tensor* ffn_ln_w = ctx->model.tensors[layer + ".output.LayerNorm.weight"];
-        ggml_tensor* ffn_ln_b = ctx->model.tensors[layer + ".output.LayerNorm.bias"];
-
-        ggml_tensor* h = ggml_mul_mat(compute_ctx, ffn_w1, x);
-        h = ggml_add(compute_ctx, h, ffn_b1);
-        h = ggml_gelu(compute_ctx, h);
-        h = ggml_mul_mat(compute_ctx, ffn_w2, h);
-        h = ggml_add(compute_ctx, h, ffn_b2);
-
-        // residual + LayerNorm
-        h = ggml_add(compute_ctx, x, h);
-        h = ggml_norm(compute_ctx, h, 1e-7f); // todo: use actual eps from model file
-        h = ggml_mul(compute_ctx, h, ffn_ln_w);
-        h = ggml_add(compute_ctx, h, ffn_ln_b);
-        x = h;
+        deberta_inter_ffn_tensors inter_ffn_tensors = {
+            .inter_w = ctx->model.tensors[layer_prefix + std::to_string(i) + ".intermediate.dense.weight"],
+            .inter_b = ctx->model.tensors[layer_prefix + std::to_string(i) + ".intermediate.dense.bias"],
+            .out_w = ctx->model.tensors[layer_prefix + std::to_string(i) + ".output.dense.weight"],
+            .out_b = ctx->model.tensors[layer_prefix + std::to_string(i) + ".output.dense.bias"],
+            .ln_w = ctx->model.tensors[layer_prefix + std::to_string(i) + ".output.LayerNorm.weight"],
+            .ln_b = ctx->model.tensors[layer_prefix + std::to_string(i) + ".output.LayerNorm.bias"],
+        };
+        x = deberta_build_ffn(compute_ctx, x, inter_ffn_tensors);
     }
 
     struct ggml_cgraph* gf = ggml_new_graph(compute_ctx);

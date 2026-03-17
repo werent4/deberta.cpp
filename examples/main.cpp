@@ -1,15 +1,30 @@
 #include <cstdio>
+#include <cstring>
 #include <vector>
 #include "ggml/include/ggml.h"
 #include "ggml/include/ggml-cpu.h"
 #include "deberta.h"
+
+    // auto print_tensor = [&](const char* name) {
+    //     for (int i = 0; i < ggml_graph_n_nodes(graph); i++) {
+    //         struct ggml_tensor* node = ggml_graph_node(graph, i);
+    //         if (strcmp(ggml_get_name(node), name) == 0) {
+    //             float* d = (float*)node->data;
+    //             printf("%s: ", name);
+    //             for (int j = 0; j < 8; j++) printf("%.4f ", d[j]);
+    //             printf("\n");
+    //             return;
+    //         }
+    //     }
+    //     printf("%s: not found\n", name);
+    // };
 
 int main(int argc, char ** argv) {
     if (argc < 2) {
         fprintf(stderr, "usage: %s model.bin\n", argv[0]);
         return 1;
     }
-    std::vector<int> input_ids = {1, 31414, 232, 328, 2}; // [CLS] Hello world ! [SEP]
+    std::vector<int> input_ids = {5365, 447}; // [CLS] Hello world ! [SEP]
 
     deberta_ctx* new_deberta_ctx = deberta_load_from_file(argv[1]);
     if (!new_deberta_ctx) {
@@ -18,7 +33,7 @@ int main(int argc, char ** argv) {
     }
 
     struct ggml_init_params compute_params = {
-        /*.mem_size   =*/ 256 * 1024 * 1024,
+        /*.mem_size   =*/ 1024 * 1024 * 1024,
         /*.mem_buffer =*/ NULL,
         /*.no_alloc   =*/ false,
     };
@@ -39,13 +54,14 @@ int main(int argc, char ** argv) {
 
     ggml_graph_compute_with_ctx(compute_ctx, graph, 1);
     struct ggml_tensor* output = ggml_graph_node(graph, ggml_graph_n_nodes(graph) - 1);
-
-    printf("output shape: [%lld, %lld]\n", output->ne[0], output->ne[1]);
     float* data = (float*)output->data;
-    printf("embeddings[0]: ");
-    for (int i = 0; i < 8; i++) {
-        printf("%.4f ", data[i]);
-    }
+
+    printf("encoder_out[0,:8]: ");
+    for (int i = 0; i < 8; i++) printf("%.4f ", data[i]);
+    printf("\n");
+
+    printf("encoder_out[1,:8]: ");
+    for (int i = 0; i < 8; i++) printf("%.4f ", data[768 + i]);
     printf("\n");
 
     deberta_free(new_deberta_ctx);
