@@ -18,21 +18,23 @@ ftype = int(sys.argv[2]) if len(sys.argv) > 2 else 1
 ftype_str = ["f32", "f16"]
 fname_out = dir_model + f"/ggml-model-{ftype_str[ftype]}.bin"
 
+# Map ftype to torch dtype
+torch_dtype = torch.float32 if ftype == 0 else torch.float16
+
 if not os.path.exists(dir_model):
     model_name = "microsoft/deberta-v3-base"
     print(f"Downloading {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name, torch_dtype=torch_dtype)
     tokenizer.save_pretrained(dir_model)
     model.save_pretrained(dir_model)
 
 with open(dir_model + "/config.json", "r") as f:
     hparams = json.load(f)
-
-print("Config:", json.dumps(hparams, indent=2))
+    print("Config:", json.dumps(hparams, indent=2))
 
 tokenizer = AutoTokenizer.from_pretrained(dir_model)
-model = AutoModel.from_pretrained(dir_model, low_cpu_mem_usage=True)
+model = AutoModel.from_pretrained(dir_model, low_cpu_mem_usage=True, torch_dtype=torch_dtype)
 
 print(model)
 
