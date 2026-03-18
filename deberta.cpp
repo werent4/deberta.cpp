@@ -237,11 +237,11 @@ static int32_t log_bucket_pos(int32_t rel_pos, int bucket_size, int max_position
         return rel_pos;
 
     int sign = (rel_pos > 0) ? 1 : -1;
-    float abs_pos = (float)std::abs(rel_pos);
-    float log_pos = std::ceil(
+    double abs_pos = (double)std::abs(rel_pos);
+    double log_pos = std::ceil(
         std::log(abs_pos / mid) /
-        std::log((float)(max_position - 1) / mid) *
-        (float)(mid - 1)
+        std::log((double)(max_position - 1) / mid) *
+        (double)(mid - 1)
     ) + mid;
     return (int32_t)(sign * log_pos);
 }
@@ -309,7 +309,7 @@ static ggml_tensor* deberta_build_attention(
     const int n_pos = 2 * att_span;
 
     size_t offset = (size_t)(max_rel - att_span) * rel_emb->nb[1];
-    ggml_tensor* rel_slice = ggml_view_2d(cctx, rel_emb, rel_emb->ne[0], n_pos, rel_emb->nb[1], 0); // offset
+    ggml_tensor* rel_slice = ggml_view_2d(cctx, rel_emb, rel_emb->ne[0], n_pos, rel_emb->nb[1], offset); // 0?
 
 
     ggml_tensor* pos_key = ggml_mul_mat(cctx, T.k_w, rel_slice);
