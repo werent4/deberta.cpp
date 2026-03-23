@@ -6,6 +6,12 @@
 
 #include "ggml/include/ggml-cpu.h"
 
+#define DPRINT(name, a, b) \
+    fprintf(stderr, "[%s:%d] %s: a=[%lld,%lld,%lld] b=[%lld,%lld,%lld]\n", \
+        __func__, __LINE__, name, \
+        (a)->ne[0],(a)->ne[1],(a)->ne[2], \
+        (b)->ne[0],(b)->ne[1],(b)->ne[2])
+
 bool deberta_load_hparams(FILE* f, deberta_model& model) {
     if (!f) {
         fprintf(stderr, "failed to open file\n");

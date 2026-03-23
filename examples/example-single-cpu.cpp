@@ -17,7 +17,7 @@ int main(int argc, char ** argv) {
             input_ids.push_back(std::atoi(argv[i]));
         }
     } else {
-        std::vector<int> input_ids = {
+        input_ids = {
             7898,   267,  6865, 30256,   261, 51803,   261, 22272,  1196,   315,
             1206,   275, 24503, 13451,   416,  4994,   275,  5022,   780,   267,
             3037,   260,   383,  1181,   266,  2041,  1472,   288,   780,   261,
@@ -49,6 +49,10 @@ int main(int argc, char ** argv) {
     }
 
     int seq_len = input_ids.size();
+    if (seq_len == 0) {
+        fprintf(stderr, "no input tokens provided\n");
+        return 1;
+    }
 
     deberta_ctx* new_deberta_ctx = deberta_load_from_file(argv[1]);
     if (!new_deberta_ctx) {
