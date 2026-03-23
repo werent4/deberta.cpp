@@ -73,3 +73,24 @@ struct ggml_cgraph* deberta_build_graph(
     struct ggml_context* compute_ctx,
     const std::vector<int>& input_ids
 );
+
+// batch 
+// Do I rly need this struct??
+struct deberta_batch_input {
+    std::vector<std::vector<int>> input_ids; // [batch_size][seq_len]
+    std::vector<std::vector<int>> attention_mask; // [batch_size][seq_len]
+
+    int batch_size() const {
+        return input_ids.size();
+    }
+    int seq_len() const {
+        if (input_ids.empty()) return 0;
+        return input_ids[0].size();
+    }
+};
+
+struct ggml_cgraph* deberta_build_graph_batch(
+    struct deberta_ctx* ctx,
+    struct ggml_context* compute_ctx,
+    const deberta_batch_input& batch_input
+);

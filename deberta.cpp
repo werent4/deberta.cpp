@@ -1,16 +1,24 @@
 #include "deberta.h"
 #include <algorithm>
 #include <cmath>
+// #include <limits>
 #include <cstdio>
 #include <cstring>
 
 #include "ggml/include/ggml-cpu.h"
 
-#define DPRINT(name, a, b) \
+#define DPRINT_3d(name, a, b) \
     fprintf(stderr, "[%s:%d] %s: a=[%lld,%lld,%lld] b=[%lld,%lld,%lld]\n", \
         __func__, __LINE__, name, \
         (a)->ne[0],(a)->ne[1],(a)->ne[2], \
         (b)->ne[0],(b)->ne[1],(b)->ne[2])
+
+#define DPRINT_4d(name, a, b) \
+    fprintf(stderr, "[%s:%d] %s: a=[%lld,%lld,%lld,%lld] b=[%lld,%lld,%lld,%lld]\n", \
+        __func__, __LINE__, name, \
+        (a)->ne[0],(a)->ne[1],(a)->ne[2],(a)->ne[3], \
+        (b)->ne[0],(b)->ne[1],(b)->ne[2],(b)->ne[3])
+
 
 bool deberta_load_hparams(FILE* f, deberta_model& model) {
     if (!f) {
@@ -461,6 +469,278 @@ struct ggml_cgraph* deberta_build_graph(
             .ln_b = ctx->model.tensors[layer_prefix + std::to_string(i) + ".output.LayerNorm.bias"],
         };
         x = deberta_build_ffn(compute_ctx, x, inter_ffn_tensors);
+    }
+
+    struct ggml_cgraph* gf = ggml_new_graph(compute_ctx);
+    ggml_build_forward_expand(gf, x);
+    return gf;
+}
+
+/// batch forward
+static void gather_batch_custom_op(
+    struct ggml_tensor* dst, 
+    const struct ggml_tensor* dummy,
+    const struct ggml_tensor* src,
+    int ith, int nth, void* userdata
+) {
+    (void)ith; (void)nth; (void)dummy;
+    const int32_t* idx  = (const int32_t*)userdata;
+    const float* in = (const float*)src->data;
+    float* out  = (float*)dst->data;
+
+    const int seq = dst->ne[0];
+    const int n_heads = dst->ne[2];
+    const int n_pos = src->ne[0];
+    const int batch_size = dst->ne[3];
+
+    for (int b = 0; b < batch_size; b++)
+        for (int h = 0; h < n_heads; h++)
+            for (int i = 0; i < seq; i++)
+                for (int j = 0; j < seq; j++)
+                    out[j + i*seq + h*seq*seq + b*seq*seq*n_heads] = in[idx[j + i*seq] + i*n_pos + h*n_pos*seq + b*n_pos*seq*n_heads];
+}
+
+static ggml_tensor* ggml_gather_batch_axis1(
+    ggml_context* ctx,
+    ggml_tensor*  src,
+    ggml_tensor*  idx_tensor,
+    int seq, int n_heads, int batch_size
+) {
+    ggml_tensor* dummy = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, seq, seq, n_heads, batch_size);
+    return ggml_map_custom2(ctx, dummy, src, gather_batch_custom_op, 1, (void*)idx_tensor->data);
+}
+
+
+static ggml_tensor* deberta_build_batch_embeddings(
+    struct ggml_context* compute_ctx,
+    struct deberta_ctx* ctx,
+    const deberta_batch_input& batch_input
+) {
+    ggml_tensor* input_ids_tensor = ggml_new_tensor_2d(
+        compute_ctx, GGML_TYPE_I32, batch_input.seq_len(), batch_input.batch_size()); // todo: select type based on model.wtype
+
+    for (size_t i = 0; i < batch_input.batch_size(); i++) {
+        int offset = i * batch_input.seq_len() * sizeof(int);
+        char* dst = (char*)input_ids_tensor->data + offset;
+        memcpy(dst, batch_input.input_ids[i].data(), batch_input.seq_len() * sizeof(int));
+    }
+
+    
+    ggml_tensor* word_embeddings = ctx->model.tensors["embeddings.word_embeddings.weight"];
+    input_ids_tensor = ggml_reshape_1d(compute_ctx, input_ids_tensor, batch_input.seq_len() * batch_input.batch_size());
+    ggml_tensor* x = ggml_get_rows(compute_ctx, word_embeddings, input_ids_tensor);
+    x = ggml_reshape_3d(compute_ctx, x, ctx->model.hparams.hidden_size, batch_input.seq_len(), batch_input.batch_size());
+
+    ggml_tensor* ln_w = ctx->model.tensors["embeddings.LayerNorm.weight"];
+    ggml_tensor* ln_b = ctx->model.tensors["embeddings.LayerNorm.bias"];
+
+    x = ggml_norm(compute_ctx, x, 1e-7f); // todo: use actual eps from model file
+    x = ggml_mul(compute_ctx, x, ln_w);
+    x = ggml_add(compute_ctx, x, ln_b);
+
+    return x;
+}
+
+static ggml_tensor* deberta_build_batch_attention(
+    ggml_context* cctx,
+    ggml_tensor* x, // [hidden, seq, batch]
+    ggml_tensor* attn_masks, // [seq, batch]
+    deberta_attn_tensors& T,
+    ggml_tensor* rel_emb,  
+    int n_heads,
+    int head_dim,
+    int seq,
+    int max_rel,
+    int max_pos
+) {
+    int batch_size = x->ne[2];
+    const int hidden = n_heads * head_dim;
+    const float scale = sqrtf((float)(head_dim * 3));
+    // c2c
+    // [hid_dim, seq, batch]
+    ggml_tensor* Q = ggml_mul_mat(cctx, T.q_w, x);
+    Q = ggml_add(cctx, Q, T.q_b);
+    
+    ggml_tensor* K = ggml_mul_mat(cctx, T.k_w, x);
+    K = ggml_add(cctx, K, T.k_b);
+    
+    ggml_tensor* V = ggml_mul_mat(cctx, T.v_w, x);
+    V = ggml_add(cctx, V, T.v_b);
+
+    Q = ggml_reshape_4d(cctx, Q, head_dim, n_heads, seq, batch_size);
+    K = ggml_reshape_4d(cctx, K, head_dim, n_heads, seq, batch_size);
+    V = ggml_reshape_4d(cctx, V, head_dim, n_heads, seq, batch_size); // [head_dim, n_heads, seq, batch]
+
+    Q = ggml_scale(cctx, Q, 1.0f / scale);
+
+    Q = ggml_cont(cctx, ggml_permute(cctx, Q, 0, 2, 1, 3)); // [head_dim, seq, n_heads, batch]
+    K = ggml_cont(cctx, ggml_permute(cctx, K, 0, 2, 1, 3));
+    V = ggml_cont(cctx, ggml_permute(cctx, V, 1, 2, 0, 3)); // [n_heads, head_dim, seq, batch]
+
+    ggml_tensor* scores = ggml_mul_mat(cctx, K, Q);
+
+    // c2p
+    const int att_span = max_rel;
+    const int n_pos = 2 * att_span;
+
+    size_t offset = (size_t)(max_rel - att_span) * rel_emb->nb[1];
+    ggml_tensor* rel_slice = ggml_view_2d(cctx, rel_emb, rel_emb->ne[0], n_pos, rel_emb->nb[1], offset);
+
+    ggml_tensor* pos_key = ggml_mul_mat(cctx, T.k_w, rel_slice);
+    pos_key = ggml_add(cctx, pos_key,
+                  ggml_repeat(cctx,
+                      ggml_reshape_2d(cctx, T.k_b, T.k_b->ne[0], 1),
+                      pos_key));
+
+    pos_key = ggml_reshape_3d(cctx, pos_key, head_dim, n_heads, n_pos);
+    pos_key = ggml_cont(cctx, ggml_permute(cctx, pos_key, 0, 2, 1, 3)); // [head_dim, n_pos, n_heads]
+
+    ggml_tensor* c2p_raw = ggml_mul_mat(cctx, pos_key, Q);
+    ggml_tensor* c2p_idx = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, seq, seq);
+    {
+        int32_t* p = (int32_t*)c2p_idx->data;
+        for (int i = 0; i < seq; i++)
+            for (int j = 0; j < seq; j++) {
+                int32_t raw_c2p = log_bucket_pos(i - j, att_span, max_pos);
+                p[j + i*seq] = std::clamp(raw_c2p + att_span, 0, n_pos - 1);
+            }
+    }
+
+    ggml_tensor* c2p = ggml_gather_batch_axis1(cctx, c2p_raw, c2p_idx, seq, n_heads, batch_size);
+    scores = ggml_add(cctx, scores, c2p);
+
+    // p2c 
+    ggml_tensor* pos_query = ggml_mul_mat(cctx, T.q_w, rel_slice);
+    pos_query = ggml_add(cctx, pos_query,
+                  ggml_repeat(cctx,
+                      ggml_reshape_2d(cctx, T.q_b, T.q_b->ne[0], 1),
+                      pos_query));
+
+    pos_query = ggml_reshape_3d(cctx, pos_query, head_dim, n_heads, n_pos);
+    pos_query = ggml_cont(cctx, ggml_permute(cctx, pos_query, 0, 2, 1, 3)); 
+    pos_query = ggml_scale(cctx, pos_query, 1.0f / scale);
+
+    ggml_tensor* p2c_raw = ggml_mul_mat(cctx, pos_query, K);
+
+    ggml_tensor* p2c_idx = ggml_new_tensor_2d(cctx, GGML_TYPE_I32, seq, seq);
+    {
+        int32_t* p = (int32_t*)p2c_idx->data;
+        for (int i = 0; i < seq; i++)
+            for (int j = 0; j < seq; j++) {
+                int32_t raw_p2c = log_bucket_pos(-(i - j), att_span, max_pos);
+                p[j + i*seq] = std::clamp(raw_p2c + att_span, 0, n_pos - 1);
+            }
+    }
+    ggml_tensor* p2c = ggml_gather_batch_axis1(cctx, p2c_raw, p2c_idx, seq, n_heads, batch_size);
+    p2c = ggml_cont(cctx, ggml_permute(cctx, p2c, 1, 0, 2, 3));
+
+    scores = ggml_add(cctx, scores, p2c); // [seq_q, seq_k, n_heads, batch]
+
+    attn_masks = ggml_reshape_4d(cctx, attn_masks, seq, 1, 1, batch_size);
+    attn_masks = ggml_repeat(cctx, attn_masks, scores);
+
+    scores = ggml_add(cctx, scores, attn_masks);
+    scores = ggml_soft_max(cctx, scores);
+
+    ggml_tensor* ctx_layer = ggml_mul_mat(cctx, V, scores);
+    ctx_layer = ggml_cont(cctx, ggml_permute(cctx, ctx_layer, 0, 2, 1, 3)); // [head_dim, n_heads, seq, batch]
+    ctx_layer = ggml_reshape_3d(cctx, ctx_layer, hidden, seq, batch_size);
+
+    ggml_tensor* attn_out = ggml_mul_mat(cctx, T.out_w, ctx_layer);
+    attn_out = ggml_add(cctx, attn_out,
+                   ggml_repeat(cctx,
+                       ggml_reshape_3d(cctx, T.out_b, T.out_b->ne[0], 1, 1),
+                       attn_out));
+
+    attn_out = ggml_add(cctx, attn_out, x);
+    attn_out = ggml_norm(cctx, attn_out, 1e-7f);
+    attn_out = ggml_add(cctx, ggml_mul(cctx, attn_out, T.ln_w), T.ln_b);
+
+    return attn_out;
+}
+
+static ggml_tensor* deberta_build_batch_ffn(
+    ggml_context* cctx,
+    ggml_tensor* x, // [hidden, seq, batchh]
+    deberta_inter_ffn_tensors& T
+) {
+    ggml_tensor* inter = ggml_mul_mat(cctx, T.inter_w, x);
+    inter = ggml_add(cctx, inter,
+                 ggml_repeat(cctx,
+                     ggml_reshape_3d(cctx, T.inter_b, T.inter_b->ne[0], 1, 1),
+                     inter));
+
+    inter = ggml_unary(cctx, inter, GGML_UNARY_OP_GELU_ERF);
+
+    ggml_tensor* out = ggml_mul_mat(cctx, T.out_w, inter);
+    out = ggml_add(cctx, out,
+                 ggml_repeat(cctx,
+                     ggml_reshape_3d(cctx, T.out_b, T.out_b->ne[0], 1, 1),
+                     out));
+    out = ggml_add(cctx, out, x);
+    out = ggml_norm(cctx, out, 1e-7f);
+    out = ggml_add(cctx, ggml_mul(cctx, out, T.ln_w), T.ln_b); 
+    return out;
+}
+
+struct ggml_cgraph* deberta_build_graph_batch(
+    struct deberta_ctx* ctx,
+    struct ggml_context* compute_ctx,
+    const deberta_batch_input& batch_input
+) {
+    int n_heads = ctx->model.hparams.num_attention_heads;
+    int head_dim = ctx->model.hparams.hidden_size / n_heads;
+    int max_rel = ctx->model.hparams.max_relative_positions;   
+    if (max_rel < 1) {
+        max_rel = ctx->model.hparams.position_buckets;
+    }
+    int max_pos = ctx->model.hparams.max_position_embeddings;
+
+    ggml_tensor* attn_masks = ggml_new_tensor_2d(compute_ctx, GGML_TYPE_F32, batch_input.seq_len(), batch_input.batch_size());
+    for (size_t i = 0; i < batch_input.batch_size(); i++) {
+        float* dst = (float*)attn_masks->data + i * batch_input.seq_len();
+        for (size_t j = 0; j < batch_input.seq_len(); j++) {
+            dst[j] = batch_input.attention_mask[i][j] == 1 ? 0.0f : -INFINITY;
+        }
+    }
+
+    ggml_tensor* x = deberta_build_batch_embeddings(compute_ctx, ctx, batch_input);
+
+    std::string layer_prefix = "encoder.layer.";
+    ggml_tensor* rel_emb = ctx->model.tensors["encoder.rel_embeddings.weight"];
+    rel_emb = ggml_norm(compute_ctx, rel_emb, 1e-7f);
+    rel_emb = ggml_add(compute_ctx,
+            ggml_mul(compute_ctx, rel_emb, ctx->model.tensors["encoder.LayerNorm.weight"]),
+            ctx->model.tensors["encoder.LayerNorm.bias"]);
+
+
+
+    int N = ctx->model.hparams.num_hidden_layers;
+    for (int i = 0; i < N; i++) {
+        deberta_attn_tensors attn_tensors = {
+            .q_w = ctx->model.tensors[layer_prefix + std::to_string(i) + ".attention.self.query_proj.weight"],
+            .q_b = ctx->model.tensors[layer_prefix + std::to_string(i) + ".attention.self.query_proj.bias"],
+            .k_w = ctx->model.tensors[layer_prefix + std::to_string(i) + ".attention.self.key_proj.weight"],
+            .k_b = ctx->model.tensors[layer_prefix + std::to_string(i) + ".attention.self.key_proj.bias"],
+            .v_w = ctx->model.tensors[layer_prefix + std::to_string(i) + ".attention.self.value_proj.weight"],
+            .v_b = ctx->model.tensors[layer_prefix + std::to_string(i) + ".attention.self.value_proj.bias"],
+            .out_w = ctx->model.tensors[layer_prefix + std::to_string(i) + ".attention.output.dense.weight"],
+            .out_b = ctx->model.tensors[layer_prefix + std::to_string(i) + ".attention.output.dense.bias"],
+            .ln_w = ctx->model.tensors[layer_prefix + std::to_string(i) + ".attention.output.LayerNorm.weight"],
+            .ln_b = ctx->model.tensors[layer_prefix + std::to_string(i) + ".attention.output.LayerNorm.bias"],
+        };
+
+        x = deberta_build_batch_attention(compute_ctx, x, attn_masks, attn_tensors, rel_emb, n_heads, head_dim, batch_input.seq_len(), max_rel, max_pos);
+
+        deberta_inter_ffn_tensors inter_ffn_tensors = {
+            .inter_w = ctx->model.tensors[layer_prefix + std::to_string(i) + ".intermediate.dense.weight"],
+            .inter_b = ctx->model.tensors[layer_prefix + std::to_string(i) + ".intermediate.dense.bias"],
+            .out_w = ctx->model.tensors[layer_prefix + std::to_string(i) + ".output.dense.weight"],
+            .out_b = ctx->model.tensors[layer_prefix + std::to_string(i) + ".output.dense.bias"],
+            .ln_w = ctx->model.tensors[layer_prefix + std::to_string(i) + ".output.LayerNorm.weight"],
+            .ln_b = ctx->model.tensors[layer_prefix + std::to_string(i) + ".output.LayerNorm.bias"],
+        };
+        x = deberta_build_batch_ffn(compute_ctx, x, inter_ffn_tensors);
     }
 
     struct ggml_cgraph* gf = ggml_new_graph(compute_ctx);

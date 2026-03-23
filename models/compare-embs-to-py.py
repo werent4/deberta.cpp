@@ -10,7 +10,7 @@ from transformers import AutoTokenizer, AutoModel
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))  # ~/deberta.cpp/models
 ROOT_DIR   = os.path.dirname(BASE_DIR) # ~/deberta.cpp
 
-cpp_binary = os.path.join(ROOT_DIR, "build", "main")
+cpp_binary = os.path.join(ROOT_DIR, "build", "examples" ,"example-single-cpu")
 model_bin  = os.path.join(ROOT_DIR, "ggml-deberta", "ggml-model-f32.bin")
 cpp_out    = os.path.join(ROOT_DIR, "cpp_out.txt")
 model_name = "microsoft/deberta-v3-base"
