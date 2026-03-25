@@ -3,6 +3,15 @@
 #include <map>
 #include <vector>
 #include "ggml/include/ggml.h"
+#include "ggml/include/ggml-cpu.h"
+
+#define DEBERTA_MAX_NODES 8192
+#define HYPER_MAGIC_SIZE 14 // skip hparams + magic (14 integers)
+
+enum deberta_device {
+    DEBERTA_DEVICE_CPU,
+    DEBERTA_DEVICE_CUDA,
+};
 
 struct deberta_hparams {
     int vocab_size;
@@ -26,10 +35,18 @@ struct deberta_model {
     ggml_type wtype; 
     std::map<std::string, struct ggml_tensor*> tensors;
     deberta_hparams hparams;
+
+    ggml_backend* backend = NULL;
+    ggml_backend_buffer_t buffer_w = NULL;
 };
 
 struct deberta_ctx {
     deberta_model model;
+
+    ggml_context* ctx_precomp = NULL;
+    ggml_tensor* c2p_idx = NULL; // [seq, seq]
+    ggml_tensor* p2c_idx = NULL; // [seq, seq]
+    int cached_seq_len = 0; // for calculation of p2c/c2p_idx 
 };
 
 struct deberta_attn_tensors {
@@ -58,12 +75,6 @@ static ggml_type ftype_to_ggml_type(int ftype) {
 
 bool deberta_load_hparams(FILE* f, deberta_model & model);
 
-bool deberta_print_tensors(FILE* f);
-
-bool deberta_calc_mem_req(FILE* f, size_t& model_mem_req);
-
-bool deberta_load_weights(FILE* f, struct deberta_model* model);
-
 struct deberta_ctx* deberta_load_from_file(const std::string& fname);
 
 void deberta_free(deberta_ctx* ctx);
@@ -75,22 +86,12 @@ struct ggml_cgraph* deberta_build_graph(
 );
 
 // batch 
-// Do I rly need this struct??
-struct deberta_batch_input {
-    std::vector<std::vector<int>> input_ids; // [batch_size][seq_len]
-    std::vector<std::vector<int>> attention_mask; // [batch_size][seq_len]
 
-    int batch_size() const {
-        return input_ids.size();
-    }
-    int seq_len() const {
-        if (input_ids.empty()) return 0;
-        return input_ids[0].size();
-    }
-};
-
-struct ggml_cgraph* deberta_build_graph_batch(
-    struct deberta_ctx* ctx,
-    struct ggml_context* compute_ctx,
-    const deberta_batch_input& batch_input
+bool deberta_eval(
+    deberta_ctx* ctx,
+    ggml_gallocr_t allocr,
+    const int n_threads,
+    const std::vector<std::vector<int>> & input_ids,
+    const std::vector<std::vector<int>> & attention_mask,
+    std::vector<float> & output
 );

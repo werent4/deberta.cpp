@@ -2,10 +2,13 @@
 #include <cstring>
 #include <vector>
 #include "ggml/include/ggml.h"
-#include "ggml/include/ggml-cpu.h"
 #include "deberta.h"
 
 int main(int argc, char ** argv) {
+#ifdef GGML_USE_CUDA
+    printf("btw, cuda is compiled!\n");
+#endif
+
     if (argc < 2) {
         fprintf(stderr, "usage: %s model.bin \n", argv[0]);
         return 1;
@@ -45,41 +48,30 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "failed to load model from file '%s'\n", argv[1]);
         return 1;
     }
-
-    struct ggml_init_params compute_params = {
-        /*.mem_size   =*/ 2ull * 1024 * 1024 * 1024,  // 2GB
-        /*.mem_buffer =*/ NULL,
-        /*.no_alloc   =*/ false,
-    };
-
-    struct ggml_context* compute_ctx = ggml_init(compute_params);
-    if (!compute_ctx) {
-        fprintf(stderr, "failed to initialize ggml context for computation\n");
-        deberta_free(new_deberta_ctx);
-        return 1;
-    }    
-
-    deberta_batch_input batch_input = {
-        .input_ids = input_ids,
-        .attention_mask = attention_mask
-    };
-    struct ggml_cgraph* graph = deberta_build_graph_batch(new_deberta_ctx, compute_ctx, batch_input);
-    if (!graph) {
-        fprintf(stderr, "failed to build computation graph\n");
-        deberta_free(new_deberta_ctx);
-        ggml_free(compute_ctx);
-        return 1;
+    ggml_gallocr_t allocr = NULL;
+    {
+        allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(new_deberta_ctx->model.backend));
     }
-    ggml_graph_compute_with_ctx(compute_ctx, graph, 1);
-    struct ggml_tensor* output = ggml_graph_node(graph, ggml_graph_n_nodes(graph) - 1); // [hidden, seq, batch];
-    float* data = (float*)output->data;
-    int batch = output->ne[2];
-    int seq = output->ne[1];
-    int hidden = output->ne[0];
+
+    std::vector<float> output;
+
+    deberta_eval(
+        new_deberta_ctx,
+        allocr,
+        1,
+        input_ids,
+        attention_mask,
+        output
+    );
+
+    float* data = output.data();
+    int batch = input_ids.size();
+    int seq = input_ids[0].size();
+    int hidden = new_deberta_ctx->model.hparams.hidden_size;
 
     // / FINAL OUTPUT !!!!!!!
     FILE* f = fopen("cpp_batch_out.txt", "w");
-    for (size_t b = 0; b < batch_input.batch_size(); b++) {
+    for (size_t b = 0; b < batch; b++) {
         for (int t = 0; t < seq; t++) {
             for (int i = 0; i < hidden; i++) {
                 fprintf(f, "%.6f", data[i + hidden * t + b*seq*hidden]);
@@ -89,7 +81,7 @@ int main(int argc, char ** argv) {
         }
     }
     fclose(f);
-    printf("wrote %d tokens to cpp_batch_out.txt\n", batch_input.seq_len());
+    printf("wrote %d tokens to cpp_batch_out.txt\n", seq);
 
     // float* data = (float*)output->data;
     printf("first 10 values (batch 1): ");
@@ -98,5 +90,7 @@ int main(int argc, char ** argv) {
     }
     printf("\n");
 
-
+    ggml_gallocr_free(allocr);
+    deberta_free(new_deberta_ctx);
+    return 0;
 }
