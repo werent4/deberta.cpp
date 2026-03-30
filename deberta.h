@@ -43,6 +43,9 @@ struct deberta_model {
 struct deberta_ctx {
     deberta_model model;
 
+    ggml_backend_t cpu_backend = NULL;  // gather on CPU offload
+    ggml_backend_sched_t sched = NULL;
+
     ggml_context* ctx_precomp = NULL;
     ggml_tensor* c2p_idx = NULL; // [seq, seq]
     ggml_tensor* p2c_idx = NULL; // [seq, seq]
@@ -75,21 +78,13 @@ static ggml_type ftype_to_ggml_type(int ftype) {
 
 bool deberta_load_hparams(FILE* f, deberta_model & model);
 
-struct deberta_ctx* deberta_load_from_file(const std::string& fname);
+struct deberta_ctx* deberta_load_from_file(const std::string& fname, const deberta_device device);
 
 void deberta_free(deberta_ctx* ctx);
-
-struct ggml_cgraph* deberta_build_graph(
-    struct deberta_ctx* ctx,
-    struct ggml_context* compute_ctx,
-    const std::vector<int>& input_ids
-);
-
 // batch 
 
 bool deberta_eval(
     deberta_ctx* ctx,
-    ggml_gallocr_t allocr,
     const int n_threads,
     const std::vector<std::vector<int>> & input_ids,
     const std::vector<std::vector<int>> & attention_mask,

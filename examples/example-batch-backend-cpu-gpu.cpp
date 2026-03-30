@@ -42,23 +42,17 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-
-    deberta_ctx* new_deberta_ctx = deberta_load_from_file(argv[1]);
+    deberta_ctx* new_deberta_ctx = deberta_load_from_file(argv[1], DEBERTA_DEVICE_CUDA);
     if (!new_deberta_ctx) {
         fprintf(stderr, "failed to load model from file '%s'\n", argv[1]);
         return 1;
-    }
-    ggml_gallocr_t allocr = NULL;
-    {
-        allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(new_deberta_ctx->model.backend));
     }
 
     std::vector<float> output;
 
     deberta_eval(
         new_deberta_ctx,
-        allocr,
-        1,
+        4,
         input_ids,
         attention_mask,
         output
@@ -90,7 +84,6 @@ int main(int argc, char ** argv) {
     }
     printf("\n");
 
-    ggml_gallocr_free(allocr);
     deberta_free(new_deberta_ctx);
     return 0;
 }

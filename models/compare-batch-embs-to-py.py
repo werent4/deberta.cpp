@@ -8,10 +8,10 @@ from transformers import AutoTokenizer, AutoModel
 
 BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR   = os.path.dirname(BASE_DIR)
-cpp_binary = os.path.join(ROOT_DIR, "build", "examples", "example-batch-backend-cpu")
+cpp_binary = os.path.join(ROOT_DIR, "build", "examples", "example-batch-backend-cpu-gpu")
 model_bin  = os.path.join(ROOT_DIR, "ggml-deberta", "ggml-model-f32.bin")
 cpp_out    = os.path.join(ROOT_DIR, "cpp_batch_out.txt")
-model_name = "microsoft/deberta-v3-base"
+model_name = "/home/werent4/deberta.cpp/ggml-deberta"
 
 text_batch = [
     "The cat sat on the mat.",
@@ -63,6 +63,8 @@ cpp = cpp.reshape(batch_size, seq_len, 768)
 # --- python forward ---
 model = AutoModel.from_pretrained(model_name, torch_dtype=torch.float32)
 model.eval()
+model.to("cuda")
+inputs = {k: v.to("cuda") for k, v in inputs.items()}
 with torch.no_grad():
     outputs = model(**inputs)
 pt = outputs.last_hidden_state.cpu().numpy()  # (batch_size, seq_len, 768)
