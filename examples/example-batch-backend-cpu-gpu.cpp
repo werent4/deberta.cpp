@@ -42,7 +42,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    deberta_ctx* new_deberta_ctx = deberta_load_from_file(argv[1], DEBERTA_DEVICE_CUDA);
+    deberta_ctx* new_deberta_ctx = deberta_load_from_file(argv[1], DEBERTA_DEVICE_CPU);
     if (!new_deberta_ctx) {
         fprintf(stderr, "failed to load model from file '%s'\n", argv[1]);
         return 1;

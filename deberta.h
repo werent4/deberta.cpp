@@ -6,7 +6,7 @@
 #include "ggml/include/ggml-cpu.h"
 
 #define DEBERTA_MAX_NODES 8192
-#define HYPER_MAGIC_SIZE 14 // skip hparams + magic (14 integers)
+#define HYPER_MAGIC_SIZE 15 // skip hparams + magic (15 integers)
 
 enum deberta_device {
     DEBERTA_DEVICE_CPU,
@@ -24,11 +24,15 @@ struct deberta_hparams {
     int max_relative_positions;
     int ftype;
 
-    int   embedding_size;        // v3: 128, v1: == hidden_size
-    int   type_vocab_size;       // 
-    int   position_biased_input; // v3: 0 (false!), v1: 1
+    int embedding_size;        // v3: 128, v1: == hidden_size
+    int type_vocab_size;       // 
+    int position_biased_input; // v3: 0 (false!), v1: 1
     float layer_norm_eps;  
+    int pos_att_flags;
 };
+
+inline bool hparams_use_c2p(const deberta_hparams& h) { return h.pos_att_flags & 1; }
+inline bool hparams_use_p2c(const deberta_hparams& h) { return h.pos_att_flags & 2; }
 
 struct deberta_model {
     ggml_context* ctx;
@@ -71,7 +75,7 @@ static ggml_type ftype_to_ggml_type(int ftype) {
         case 0: return GGML_TYPE_F32;
         case 1: return GGML_TYPE_F16;
         case 2: return GGML_TYPE_Q4_0;
-        case 3: return GGML_TYPE_Q4_1;
+        case 3: return GGML_TYPE_Q4_1; 
         default: return GGML_TYPE_COUNT; // invalid
     }
 }

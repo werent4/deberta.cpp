@@ -1,6 +1,7 @@
 #include "deberta.h"
+#include "utils.h"
 #include <algorithm>
-#include <cmath>
+// #include <cmath>
 // #include <limits>
 #include <cstdio>
 #include <cstring>
@@ -9,19 +10,6 @@
 #endif
 
 #include "ggml/include/ggml-cpu.h"
-
-#define DPRINT_3d(name, a, b) \
-    fprintf(stderr, "[%s:%d] %s: a=[%lld,%lld,%lld] b=[%lld,%lld,%lld]\n", \
-        __func__, __LINE__, name, \
-        (a)->ne[0],(a)->ne[1],(a)->ne[2], \
-        (b)->ne[0],(b)->ne[1],(b)->ne[2])
-
-#define DPRINT_4d(name, a, b) \
-    fprintf(stderr, "[%s:%d] %s: a=[%lld,%lld,%lld,%lld] b=[%lld,%lld,%lld,%lld]\n", \
-        __func__, __LINE__, name, \
-        (a)->ne[0],(a)->ne[1],(a)->ne[2],(a)->ne[3], \
-        (b)->ne[0],(b)->ne[1],(b)->ne[2],(b)->ne[3])
-
 
 bool deberta_load_hparams(FILE* f, deberta_model& model) {
     if (!f) {
@@ -51,31 +39,36 @@ bool deberta_load_hparams(FILE* f, deberta_model& model) {
     fread(&hparams.type_vocab_size,       sizeof(int),   1, f);
     fread(&hparams.position_biased_input, sizeof(int),   1, f);
     fread(&hparams.layer_norm_eps,        sizeof(float), 1, f);
+    fread(&hparams.pos_att_flags, sizeof(int), 1, f);
 
     if (hparams.max_relative_positions < 1) {
         hparams.max_relative_positions = hparams.position_buckets;
     }
 
-    printf("vocab_size = %d\n", hparams.vocab_size);
-    printf("max_position_embeddings = %d\n", hparams.max_position_embeddings);
-    printf("hidden_size = %d\n", hparams.hidden_size);
-    printf("intermediate_size = %d\n", hparams.intermediate_size);
-    printf("num_attention_heads = %d\n", hparams.num_attention_heads);
-    printf("num_hidden_layers = %d\n", hparams.num_hidden_layers);
-    printf("position_buckets = %d\n", hparams.position_buckets);
-    printf("max_relative_positions = %d\n", hparams.max_relative_positions);
-    printf("ftype = %d\n", hparams.ftype);
-    printf("embedding_size = %d\n", hparams.embedding_size);
-    printf("type_vocab_size = %d\n", hparams.type_vocab_size);
-    printf("position_biased_input = %d\n", hparams.position_biased_input);
-    printf("layer_norm_eps = %f\n", hparams.layer_norm_eps);
+    // printf("vocab_size = %d\n", hparams.vocab_size);
+    // printf("max_position_embeddings = %d\n", hparams.max_position_embeddings);
+    // printf("hidden_size = %d\n", hparams.hidden_size);
+    // printf("intermediate_size = %d\n", hparams.intermediate_size);
+    // printf("num_attention_heads = %d\n", hparams.num_attention_heads);
+    // printf("num_hidden_layers = %d\n", hparams.num_hidden_layers);
+    // printf("position_buckets = %d\n", hparams.position_buckets);
+    // printf("max_relative_positions = %d\n", hparams.max_relative_positions);
+    // printf("ftype = %d\n", hparams.ftype);
+    // printf("embedding_size = %d\n", hparams.embedding_size);
+    // printf("type_vocab_size = %d\n", hparams.type_vocab_size);
+    // printf("position_biased_input = %d\n", hparams.position_biased_input);
+    // printf("layer_norm_eps = %e\n", hparams.layer_norm_eps);
+    // printf("pos_att_flags = %d (c2p=%d p2c=%d)\n",
+    //     hparams.pos_att_flags,
+    //     hparams_use_c2p(hparams),
+    //     hparams_use_p2c(hparams));
 
     fseek(f, 0, SEEK_SET); // move file pointer to the beginning of file
 
     return true;
 }
 
-static bool deberta_backend_init(deberta_model& model, const deberta_device device) {
+static bool deberta_backend_init(deberta_model& model, const deberta_device device) { // todo: select device with id
     switch (device)
     {
     case DEBERTA_DEVICE_CPU:
@@ -295,46 +288,7 @@ void deberta_free(deberta_ctx* ctx) {
     delete ctx;
 }
 
-// forward
-static int32_t log_bucket_pos(int32_t rel_pos, int bucket_size, int max_position) {
-    int mid = bucket_size / 2;
-    if (rel_pos > -mid && rel_pos < mid)
-        return rel_pos;
-
-    int sign = (rel_pos > 0) ? 1 : -1;
-    double abs_pos = (double)std::abs(rel_pos);
-    double log_pos = std::ceil(
-        std::log(abs_pos / mid) /
-        std::log((double)(max_position - 1) / mid) *
-        (double)(mid - 1)
-    ) + mid;
-    return (int32_t)(sign * log_pos);
-}
-
 /// batch forward
-static void gather_batch_custom_op(
-    struct ggml_tensor* dst, 
-    const struct ggml_tensor* dummy,
-    const struct ggml_tensor* src,
-    int ith, int nth, void* userdata
-) {
-    (void)ith; (void)nth; (void)dummy;
-    const int32_t* idx  = (const int32_t*)userdata;
-    const float* in = (const float*)src->data;
-    float* out  = (float*)dst->data;
-
-    const int seq = dst->ne[0];
-    const int n_heads = dst->ne[2];
-    const int n_pos = src->ne[0];
-    const int batch_size = dst->ne[3];
-
-    for (int b = 0; b < batch_size; b++)
-        for (int h = 0; h < n_heads; h++)
-            for (int i = 0; i < seq; i++)
-                for (int j = 0; j < seq; j++)
-                    out[j + i*seq + h*seq*seq + b*seq*seq*n_heads] = in[idx[j + i*seq] + i*n_pos + h*n_pos*seq + b*n_pos*seq*n_heads];
-}
-
 static ggml_tensor* ggml_gather_batch_axis1(
     ggml_context* ctx,
     ggml_backend_sched_t sched,
@@ -364,7 +318,7 @@ static ggml_tensor* deberta_build_batch_embeddings(
     ggml_tensor* ln_w = ctx->model.tensors.at("embeddings.LayerNorm.weight");
     ggml_tensor* ln_b = ctx->model.tensors.at("embeddings.LayerNorm.bias");
 
-    x = ggml_norm(compute_ctx, x, 1e-7f); // todo: use actual eps from model file
+    x = ggml_norm(compute_ctx, x, ctx->model.hparams.layer_norm_eps);
     x = ggml_mul(compute_ctx, x, ln_w);
     x = ggml_add(compute_ctx, x, ln_b);
 
@@ -388,7 +342,8 @@ static ggml_tensor* deberta_build_batch_attention(
 ) {
     int batch_size = x->ne[2];
     const int hidden = n_heads * head_dim;
-    const float scale = sqrtf((float)(head_dim * 3));
+    const int scale_factor = 1 + (int)(hparams_use_c2p(ctx->model.hparams) == true) + (int)(hparams_use_p2c(ctx->model.hparams) == true);
+    const float scale = sqrtf((float)(head_dim * scale_factor));
     // c2c
     // [hid_dim, seq, batch]
     ggml_tensor* Q = ggml_mul_mat(cctx, T.q_w, x);
@@ -412,42 +367,46 @@ static ggml_tensor* deberta_build_batch_attention(
 
     ggml_tensor* scores = ggml_mul_mat(cctx, K, Q);
 
-    // c2p
     const int att_span = max_rel;
     const int n_pos = 2 * att_span;
-
+    
     size_t offset = (size_t)(max_rel - att_span) * rel_emb->nb[1];
     ggml_tensor* rel_slice = ggml_view_2d(cctx, rel_emb, rel_emb->ne[0], n_pos, rel_emb->nb[1], offset);
+    
+    // c2p
+    if (hparams_use_c2p(ctx->model.hparams)) {
+        ggml_tensor* pos_key = ggml_mul_mat(cctx, T.k_w, rel_slice);
+        pos_key = ggml_add(cctx, pos_key,
+                    ggml_repeat(cctx,
+                        ggml_reshape_2d(cctx, T.k_b, T.k_b->ne[0], 1),
+                        pos_key));
 
-    ggml_tensor* pos_key = ggml_mul_mat(cctx, T.k_w, rel_slice);
-    pos_key = ggml_add(cctx, pos_key,
-                  ggml_repeat(cctx,
-                      ggml_reshape_2d(cctx, T.k_b, T.k_b->ne[0], 1),
-                      pos_key));
+        pos_key = ggml_reshape_3d(cctx, pos_key, head_dim, n_heads, n_pos);
+        pos_key = ggml_cont(cctx, ggml_permute(cctx, pos_key, 0, 2, 1, 3)); // [head_dim, n_pos, n_heads]
 
-    pos_key = ggml_reshape_3d(cctx, pos_key, head_dim, n_heads, n_pos);
-    pos_key = ggml_cont(cctx, ggml_permute(cctx, pos_key, 0, 2, 1, 3)); // [head_dim, n_pos, n_heads]
-
-    ggml_tensor* c2p_raw = ggml_mul_mat(cctx, pos_key, Q);
-    ggml_tensor* c2p = ggml_gather_batch_axis1(cctx, ctx->sched, ctx->cpu_backend, c2p_raw, c2p_idx, seq, n_heads, batch_size);
-    scores = ggml_add(cctx, scores, c2p);
+        ggml_tensor* c2p_raw = ggml_mul_mat(cctx, pos_key, Q);
+        ggml_tensor* c2p = ggml_gather_batch_axis1(cctx, ctx->sched, ctx->cpu_backend, c2p_raw, c2p_idx, seq, n_heads, batch_size);
+        scores = ggml_add(cctx, scores, c2p);
+    }
 
     // p2c 
-    ggml_tensor* pos_query = ggml_mul_mat(cctx, T.q_w, rel_slice);
-    pos_query = ggml_add(cctx, pos_query,
-                  ggml_repeat(cctx,
-                      ggml_reshape_2d(cctx, T.q_b, T.q_b->ne[0], 1),
-                      pos_query));
+    if (hparams_use_p2c(ctx->model.hparams)) {
+        ggml_tensor* pos_query = ggml_mul_mat(cctx, T.q_w, rel_slice);
+        pos_query = ggml_add(cctx, pos_query,
+                    ggml_repeat(cctx,
+                        ggml_reshape_2d(cctx, T.q_b, T.q_b->ne[0], 1),
+                        pos_query));
 
-    pos_query = ggml_reshape_3d(cctx, pos_query, head_dim, n_heads, n_pos);
-    pos_query = ggml_cont(cctx, ggml_permute(cctx, pos_query, 0, 2, 1, 3)); 
-    pos_query = ggml_scale(cctx, pos_query, 1.0f / scale);
+        pos_query = ggml_reshape_3d(cctx, pos_query, head_dim, n_heads, n_pos);
+        pos_query = ggml_cont(cctx, ggml_permute(cctx, pos_query, 0, 2, 1, 3)); 
+        pos_query = ggml_scale(cctx, pos_query, 1.0f / scale);
 
-    ggml_tensor* p2c_raw = ggml_mul_mat(cctx, pos_query, K);
-    ggml_tensor* p2c = ggml_gather_batch_axis1(cctx, ctx->sched, ctx->cpu_backend, p2c_raw, p2c_idx, seq, n_heads, batch_size);
-    p2c = ggml_cont(cctx, ggml_permute(cctx, p2c, 1, 0, 2, 3));
+        ggml_tensor* p2c_raw = ggml_mul_mat(cctx, pos_query, K);
+        ggml_tensor* p2c = ggml_gather_batch_axis1(cctx, ctx->sched, ctx->cpu_backend, p2c_raw, p2c_idx, seq, n_heads, batch_size);
+        p2c = ggml_cont(cctx, ggml_permute(cctx, p2c, 1, 0, 2, 3));
 
-    scores = ggml_add(cctx, scores, p2c); // [seq_q, seq_k, n_heads, batch]
+        scores = ggml_add(cctx, scores, p2c); // [seq_q, seq_k, n_heads, batch]
+    }
 
     attn_masks = ggml_reshape_4d(cctx, attn_masks, seq, 1, 1, batch_size);
     attn_masks = ggml_repeat(cctx, attn_masks, scores);
@@ -466,7 +425,7 @@ static ggml_tensor* deberta_build_batch_attention(
                        attn_out));
 
     attn_out = ggml_add(cctx, attn_out, x);
-    attn_out = ggml_norm(cctx, attn_out, 1e-7f);
+    attn_out = ggml_norm(cctx, attn_out, ctx->model.hparams.layer_norm_eps);
     attn_out = ggml_add(cctx, ggml_mul(cctx, attn_out, T.ln_w), T.ln_b);
 
     return attn_out;
@@ -474,6 +433,7 @@ static ggml_tensor* deberta_build_batch_attention(
 
 static ggml_tensor* deberta_build_batch_ffn(
     ggml_context* cctx,
+    const deberta_ctx* ctx,
     ggml_tensor* x, // [hidden, seq, batchh]
     deberta_inter_ffn_tensors& T
 ) {
@@ -491,7 +451,7 @@ static ggml_tensor* deberta_build_batch_ffn(
                      ggml_reshape_3d(cctx, T.out_b, T.out_b->ne[0], 1, 1),
                      out));
     out = ggml_add(cctx, out, x);
-    out = ggml_norm(cctx, out, 1e-7f);
+    out = ggml_norm(cctx, out, ctx->model.hparams.layer_norm_eps);
     out = ggml_add(cctx, ggml_mul(cctx, out, T.ln_w), T.ln_b); 
     return out;
 }
@@ -528,7 +488,7 @@ static struct ggml_cgraph* deberta_build_graph_batch(
 
     std::string layer_prefix = "encoder.layer.";
     ggml_tensor* rel_emb = ctx->model.tensors.at("encoder.rel_embeddings.weight");
-    rel_emb = ggml_norm(compute_ctx, rel_emb, 1e-7f);
+    rel_emb = ggml_norm(compute_ctx, rel_emb, ctx->model.hparams.layer_norm_eps);
     rel_emb = ggml_add(compute_ctx,
             ggml_mul(compute_ctx, rel_emb, ctx->model.tensors.at("encoder.LayerNorm.weight")),
             ctx->model.tensors.at("encoder.LayerNorm.bias"));
@@ -574,7 +534,7 @@ static struct ggml_cgraph* deberta_build_graph_batch(
             .ln_w = ctx->model.tensors.at(layer_prefix + std::to_string(i) + ".output.LayerNorm.weight"),
             .ln_b = ctx->model.tensors.at(layer_prefix + std::to_string(i) + ".output.LayerNorm.bias"),
         };
-        x = deberta_build_batch_ffn(compute_ctx, x, inter_ffn_tensors);
+        x = deberta_build_batch_ffn(compute_ctx, ctx, x, inter_ffn_tensors);
     }
 
     ggml_build_forward_expand(gf, x);

@@ -5,13 +5,45 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModel
+import argparse
 
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR   = os.path.dirname(BASE_DIR)
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--mode",
+    choices=["c2c", "c2p", "p2c", "c2p+p2c"],
+    default="c2p+p2c",
+    help="pos_att_type config to test"
+)
+args = parser.parse_args()
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ROOT_DIR = os.path.dirname(BASE_DIR)
+
+MODE_CONFIGS = {
+    "c2p+p2c": {
+        "model_name": f"{ROOT_DIR}/deberta-v3-base-c2p+p2c",
+        "model_bin":  "deberta-v3-base-c2p+p2c/ggml-model-f32.bin"
+    },
+    "c2p": {
+        "model_name": f"{ROOT_DIR}/deberta-v3-base-c2p",
+        "model_bin":  "deberta-v3-base-c2p/ggml-model-f32.bin"
+    },
+    "p2c": {
+        "model_name": f"{ROOT_DIR}/deberta-v3-base-p2c",
+        "model_bin":  "deberta-v3-base-p2c/ggml-model-f32.bin"
+    },
+    "c2c": {
+        "model_name": f"{ROOT_DIR}/deberta-v3-base-c2c",
+        "model_bin":  "deberta-v3-base-c2c/ggml-model-f32.bin"
+    },
+}
+
+
 cpp_binary = os.path.join(ROOT_DIR, "build", "examples", "example-batch-backend-cpu-gpu")
-model_bin  = os.path.join(ROOT_DIR, "ggml-deberta", "ggml-model-f32.bin")
 cpp_out    = os.path.join(ROOT_DIR, "cpp_batch_out.txt")
-model_name = "/home/werent4/deberta.cpp/ggml-deberta"
+cfg = MODE_CONFIGS[args.mode]
+model_name = cfg["model_name"]
+model_bin  = os.path.join(ROOT_DIR, cfg["model_bin"])
 
 text_batch = [
     "The cat sat on the mat.",
@@ -45,7 +77,6 @@ print(f"attention_mask[0]: {attention_mask[0]}")
 print(f"attention_mask[1]: {attention_mask[1]}\n")
 
 # --- run C++ binary ---
-# тут надо будет адаптировать под то как твой example-batch-cpu принимает инпут
 result = subprocess.run([cpp_binary, model_bin], capture_output=True, text=True)
 print(result.stdout)
 if result.returncode != 0:

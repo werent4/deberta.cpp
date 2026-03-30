@@ -6,17 +6,28 @@ import numpy as np
 import os
 from transformers import AutoModel, AutoTokenizer
 from huggingface_hub import hf_hub_download
+import argparse
 
-if len(sys.argv) < 2:
-    print("Usage: convert-to-ggml.py dir-model [ftype]")
-    print("  ftype == 0 -> float32")
-    print("  ftype == 1 -> float16")
-    sys.exit(1)
+parser = argparse.ArgumentParser()
+parser.add_argument("--model", default="microsoft/deberta-v3-base")
+parser.add_argument("--mode", choices=["c2p", "p2c", "c2p+p2c", "c2c"], default="c2p+p2c")
+parser.add_argument("--ftype", type=int, choices=[0, 1], default=1)
+args = parser.parse_args()
 
-dir_model = sys.argv[1]
-ftype = int(sys.argv[2]) if len(sys.argv) > 2 else 1
-ftype_str = ["f32", "f16"]
-fname_out = dir_model + f"/ggml-model-{ftype_str[ftype]}.bin"
+MODE_POS_ATT = {
+    "c2p+p2c": ["c2p", "p2c"],
+    "c2p":     ["c2p"],
+    "p2c":     ["p2c"],
+    "c2c":    [],
+}
+
+base_name  = args.model.split("/")[-1] if not os.path.exists(args.model) else args.model
+dir_model  = f"{base_name}-{args.mode}"
+ftype      = args.ftype
+ftype_str  = ["f32", "f16"]
+fname_out  = dir_model + f"/ggml-model-{ftype_str[ftype]}.bin"
+torch_dtype = torch.float32 if ftype == 0 else torch.float16
+pos_att_override = MODE_POS_ATT[args.mode]
 
 # Map ftype to torch dtype
 torch_dtype = torch.float32 if ftype == 0 else torch.float16
@@ -26,6 +37,7 @@ if not os.path.exists(dir_model):
     print(f"Downloading {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModel.from_pretrained(model_name, torch_dtype=torch_dtype)
+    model.config.pos_att_type = pos_att_override
     tokenizer.save_pretrained(dir_model)
     model.save_pretrained(dir_model)
 
@@ -74,6 +86,11 @@ fout.write(struct.pack("i", hparams.get("embedding_size", hparams["hidden_size"]
 fout.write(struct.pack("i", hparams.get("type_vocab_size", 0)))
 fout.write(struct.pack("i", int(hparams.get("position_biased_input", True))))
 fout.write(struct.pack("f", hparams.get("layer_norm_eps", 1e-7)))
+pos_att_type = hparams.get("pos_att_type", ["p2c", "c2p"])
+pos_att_flags = 0
+if "c2p" in pos_att_type: pos_att_flags |= 1
+if "p2c" in pos_att_type: pos_att_flags |= 2
+fout.write(struct.pack("i", pos_att_flags))
 
 # tensors
 for name, tensor in list_vars.items():
